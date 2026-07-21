@@ -97,6 +97,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -279,11 +280,40 @@ func SerializeEndpointsToJSON(endpoints []schedtypes.Endpoint) (string, error) {
 }
 
 func BuildOpenAIRequest(req *schedtypes.InferenceRequest) (map[string]any, error) {
-	requestBody := make(map[string]any)
-
 	if req == nil || req.Body == nil {
 		return nil, fmt.Errorf("missing request body")
 	}
+
+	// Prefer the full, original request body. The Rust router re-renders the
+	// model's chat template to tokenize for KV-aware routing, so it needs the
+	// complete message structure — tool_calls, tool_call_id, tools, multimodal
+	// content parts, etc. The typed ChatCompletions view only carries
+	// role+content; reconstructing from it drops those fields and produces a
+	// structurally-invalid request that the router's strict parser rejects
+	// (e.g. a role:"tool" message missing the required tool_call_id), which
+	// fails routing for the entire request.
+	if pm, ok := req.Body.Payload.(fwkrh.PayloadMap); ok && len(pm) > 0 {
+		requestBody := make(map[string]any, len(pm))
+		maps.Copy(requestBody, pm)
+		// Route on the resolved target model, not whatever alias the caller sent.
+		if strings.TrimSpace(req.TargetModel) != "" {
+			requestBody["model"] = req.TargetModel
+		}
+		return requestBody, nil
+	}
+
+	// Fallback: no raw payload available. Reconstruct a minimal request from the
+	// framework's typed view. Tool-calling turns cannot be represented here, but
+	// plain chat/completion routing still works.
+	return buildOpenAIRequestFromTyped(req)
+}
+
+// buildOpenAIRequestFromTyped reconstructs a minimal {role, content} request
+// from the framework's typed request view. It cannot preserve tool-calling
+// fields (tool_calls / tool_call_id) or other structure the typed Message does
+// not model, so it is only used when the raw payload is unavailable.
+func buildOpenAIRequestFromTyped(req *schedtypes.InferenceRequest) (map[string]any, error) {
+	requestBody := make(map[string]any)
 
 	if req.Body.ChatCompletions != nil && len(req.Body.ChatCompletions.Messages) > 0 {
 		messages := make([]map[string]any, 0, len(req.Body.ChatCompletions.Messages))
