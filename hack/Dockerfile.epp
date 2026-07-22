@@ -1,0 +1,62 @@
+# Builds the Dynamo EPP (endpoint-picker) binary from a single build context
+# (the repo root), so it works with a plain `docker build` — no buildx or named
+# build contexts required. Mirrors deploy/inference-gateway/epp/Dockerfile, but
+# without the sccache / --build-context machinery.
+#
+# Intended for a native linux/amd64 host (the Rust + Go compiles run natively).
+#
+# Build from the repo root:
+#   DOCKER_BUILDKIT=1 docker build -f hack/Dockerfile.epp \
+#     --build-arg COMMIT_SHA=$(git rev-parse HEAD) \
+#     --build-arg BUILD_REF=$(git rev-parse --abbrev-ref HEAD) \
+#     -t dynamo-epp:1.3.0-tool-fix .
+
+ARG RUST_IMAGE=rust:1.93.1
+ARG BUILDER_IMAGE=golang:1.25
+ARG BASE_IMAGE=ubuntu:24.04
+
+# =============================================================================
+# Stage 1: Build Dynamo FFI static library (Rust)
+# =============================================================================
+FROM ${RUST_IMAGE} AS rust-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler libclang-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /dynamo
+COPY .cargo/ .cargo/
+COPY Cargo.toml Cargo.lock README.md ./
+COPY lib/ lib/
+RUN cargo build --release -p libdynamo_llm && \
+    mkdir -p /out && cp target/release/libdynamo_llm_capi.a /out/ && \
+    HEADER=$(find target/release/build -name llm_engine.h -path "*/out/*" | head -1) && \
+    [ -n "$HEADER" ] && cp "$HEADER" /out/ || { echo "ERROR: llm_engine.h not found"; exit 1; }
+
+# =============================================================================
+# Stage 2: Build Go EPP binary (CGO, links the Rust FFI static library)
+# =============================================================================
+FROM ${BUILDER_IMAGE} AS go-builder
+ARG COMMIT_SHA
+ARG BUILD_REF
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libc6-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+COPY deploy/inference-gateway/epp/go.mod deploy/inference-gateway/epp/go.sum ./
+RUN go mod download
+COPY deploy/inference-gateway/epp/ .
+COPY --from=rust-builder /out/libdynamo_llm_capi.a pkg/plugins/dynamo_kv_scorer/lib/
+COPY --from=rust-builder /out/llm_engine.h    pkg/plugins/dynamo_kv_scorer/include/
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-X sigs.k8s.io/gateway-api-inference-extension/version.GitVersion=${BUILD_REF} \
+              -X sigs.k8s.io/gateway-api-inference-extension/version.GitCommit=${COMMIT_SHA}" \
+    -o epp ./cmd/epp
+
+# =============================================================================
+# Stage 3: Runtime
+# =============================================================================
+FROM ${BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*
+WORKDIR /
+COPY --from=go-builder /workspace/epp .
+RUN useradd -r -u 65532 -g nogroup nonroot
+USER 65532:65534
+ENTRYPOINT ["/epp"]
