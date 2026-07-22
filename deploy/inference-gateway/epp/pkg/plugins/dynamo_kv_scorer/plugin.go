@@ -97,6 +97,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -278,65 +279,38 @@ func SerializeEndpointsToJSON(endpoints []schedtypes.Endpoint) (string, error) {
 	return string(data), nil
 }
 
-func BuildOpenAIRequest(req *schedtypes.InferenceRequest) (map[string]any, error) {
-	requestBody := make(map[string]any)
-
+// BuildOpenAIRequestJSON serializes the request as an OpenAI-compatible JSON
+// body for the Rust router's FFI.
+//
+// A successfully parsed OpenAI request always yields a populated Payload holding
+// the complete body, so it is forwarded verbatim (overriding only the resolved
+// target model). This preserves tool_calls, tool_call_id, tools, and reasoning
+// content that the router's strict parse and chat-template rendering require —
+// fields the typed ChatCompletions view does not model. When the payload is
+// unavailable the request cannot be KV-routed, so an error is returned and the
+// scorer falls back to non-KV routing rather than a lossy reconstruction.
+func BuildOpenAIRequestJSON(req *schedtypes.InferenceRequest) (string, error) {
 	if req == nil || req.Body == nil {
-		return nil, fmt.Errorf("missing request body")
+		return "", fmt.Errorf("missing request body")
 	}
 
-	if req.Body.ChatCompletions != nil && len(req.Body.ChatCompletions.Messages) > 0 {
-		messages := make([]map[string]any, 0, len(req.Body.ChatCompletions.Messages))
-		anyNonEmpty := false
-		for _, msg := range req.Body.ChatCompletions.Messages {
-			content := msg.Content.PlainText()
-			if strings.TrimSpace(content) != "" {
-				anyNonEmpty = true
-			}
-			messages = append(messages, map[string]any{
-				"role":    msg.Role,
-				"content": content,
-			})
-		}
-		if !anyNonEmpty {
-			return nil, fmt.Errorf("empty chat messages")
-		}
-		requestBody["messages"] = messages
-	} else if req.Body.Completions != nil && !req.Body.Completions.Prompt.IsEmpty() {
-		requestBody["messages"] = []map[string]any{
-			{"role": "user", "content": req.Body.Completions.Prompt.PlainText()},
-		}
-	} else {
-		return nil, fmt.Errorf("no messages or prompt provided")
+	pm, ok := req.Body.Payload.(fwkrh.PayloadMap)
+	if !ok || len(pm) == 0 {
+		return "", fmt.Errorf("request payload unavailable; cannot build KV-routing request")
 	}
 
+	requestBody := make(map[string]any, len(pm))
+	maps.Copy(requestBody, pm)
+	// Route on the resolved target model, not whatever alias the caller sent.
 	if strings.TrimSpace(req.TargetModel) != "" {
 		requestBody["model"] = req.TargetModel
-	} else {
-		requestBody["model"] = "default"
 	}
 
-	// Forward the caller's nvext block so the Rust router can lift
-	// nvext.agent_hints.priority into priority_jump.
-	if nvext := extractNvext(req.Body.Payload); nvext != nil {
-		requestBody["nvext"] = nvext
+	data, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request JSON: %w", err)
 	}
-
-	return requestBody, nil
-}
-
-// extractNvext returns the caller-supplied nvext object from the PayloadMap,
-// or nil when the payload is not a map or does not contain an nvext object.
-//
-// This is how routing hints — most notably nvext.agent_hints.priority — reach
-// the Rust router via the FFI JSON.
-func extractNvext(payload fwkrh.RequestPayload) map[string]any {
-	pm, ok := payload.(fwkrh.PayloadMap)
-	if !ok {
-		return nil
-	}
-	nvext, _ := pm["nvext"].(map[string]any)
-	return nvext
+	return string(data), nil
 }
 
 // CallAddRequest registers a request with the router's bookkeeping.
