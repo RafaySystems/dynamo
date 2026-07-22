@@ -1,0 +1,22 @@
+# Overlays the tool-fix EPP binary onto the upstream monolithic frontend image.
+#
+# The official dynamo-frontend image serves multiple roles (frontend, workers,
+# and the EPP via entrypoint /epp). Only /epp changes for this fix, so instead
+# of rebuilding the whole frontend we copy the freshly-built /epp over the
+# stock image — keeping every other role byte-identical to the upstream release.
+#
+# EPP_IMAGE must be built first (see hack/Dockerfile.epp / hack/Makefile).
+#
+#   DOCKER_BUILDKIT=1 docker build -f hack/Dockerfile.frontend-overlay \
+#     --build-arg BASE_IMAGE=nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.3.0 \
+#     --build-arg EPP_IMAGE=dynamo-epp:1.3.0-tool-fix \
+#     -t registry.dev.rafay-edge.net/tf/dynamo-frontend:1.3.0-tool-fix .
+
+ARG BASE_IMAGE=nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.3.0
+ARG EPP_IMAGE=dynamo-epp:1.3.0-tool-fix
+
+FROM ${EPP_IMAGE} AS epp
+
+FROM ${BASE_IMAGE}
+# Stock frontend runs as the "dynamo" user; keep ownership consistent.
+COPY --chown=dynamo: --from=epp /epp /epp
