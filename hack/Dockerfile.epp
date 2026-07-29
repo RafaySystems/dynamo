@@ -25,6 +25,10 @@ WORKDIR /dynamo
 COPY .cargo/ .cargo/
 COPY Cargo.toml Cargo.lock README.md ./
 COPY lib/ lib/
+# ext-proc is a workspace member in the root Cargo.toml, so cargo needs its
+# manifest on disk to resolve the workspace even though only libdynamo_llm is
+# built here. Without it: "failed to load manifest for workspace member".
+COPY deploy/inference-gateway/ext-proc/ deploy/inference-gateway/ext-proc/
 RUN cargo build --release -p libdynamo_llm && \
     mkdir -p /out && cp target/release/libdynamo_llm_capi.a /out/ && \
     HEADER=$(find target/release/build -name llm_engine.h -path "*/out/*" | head -1) && \
