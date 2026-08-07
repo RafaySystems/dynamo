@@ -1164,6 +1164,143 @@ pub unsafe extern "C" fn free_request(
     }
 }
 
+/// Book prefill load for the selected prefill worker.
+///
+/// Call after prefill selection so subsequent prefill selections see this worker as
+/// busier. Release with `free_prefill_request` at prefill completion (first token).
+///
+/// # Safety
+/// - `handle` must be a valid RouterHandles handle
+/// - `request_id` must be a valid null-terminated C string
+/// - `token_ids` must point to `token_count` u32 values (or be null when count is 0)
+/// - `cache_namespace` must point to `cache_namespace_len` bytes (or be null when len is 0)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn add_prefill_request(
+    handle: RouterHandlesPtr,
+    request_id: *const c_char,
+    token_ids: *const u32,
+    token_count: usize,
+    worker_id: u64,
+    dp_rank: u32,
+    cache_namespace: *const u8,
+    cache_namespace_len: usize,
+) -> QueryRouterResult {
+    if handle.is_null() || request_id.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    }
+
+    let handles = unsafe { &*handle };
+    let request_id_str = match unsafe { CStr::from_ptr(request_id) }.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => return QueryRouterResult::ErrInvalidParam,
+    };
+    let cache_namespace = if cache_namespace_len == 0 {
+        None
+    } else if cache_namespace.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    } else {
+        match std::str::from_utf8(unsafe {
+            std::slice::from_raw_parts(cache_namespace, cache_namespace_len)
+        }) {
+            Ok("") => None,
+            Ok(namespace) => Some(namespace.to_owned()),
+            Err(_) => return QueryRouterResult::ErrInvalidParam,
+        }
+    };
+
+    let tokens: Vec<u32> = if token_count > 0 && !token_ids.is_null() {
+        unsafe { std::slice::from_raw_parts(token_ids, token_count) }.to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let prefill_router = handles.prefill_router.clone();
+
+    let result = handles.runtime.secondary().block_on(async {
+        let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
+
+        tokio::time::timeout(timeout_duration, async {
+            let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+            if let Err(e) = prefill_router
+                .add_request(request_id_str.clone(), &tokens, worker, cache_namespace.clone())
+                .await
+            {
+                tracing::warn!(
+                    request_id = %request_id_str,
+                    error = %e,
+                    "Failed to book prefill request"
+                );
+            }
+        })
+        .await
+    });
+
+    match result {
+        Ok(()) => QueryRouterResult::Ok,
+        Err(_elapsed) => {
+            tracing::warn!(
+                request_id = %request_id_str,
+                timeout_secs = BOOKKEEPING_TIMEOUT_SEC,
+                "add_prefill_request timed out"
+            );
+            QueryRouterResult::ErrTimeout
+        }
+    }
+}
+
+/// Release a prefill-load booking made by `add_prefill_request`.
+///
+/// Call when the prefill worker is done (first generated token). Unknown or already-freed
+/// request IDs are logged, not fatal.
+///
+/// # Safety
+/// - `handle` must be a valid RouterHandles handle
+/// - `request_id` must be a valid null-terminated C string
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free_prefill_request(
+    handle: RouterHandlesPtr,
+    request_id: *const c_char,
+) -> QueryRouterResult {
+    if handle.is_null() || request_id.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    }
+
+    let handles = unsafe { &*handle };
+    let request_id_str = match unsafe { CStr::from_ptr(request_id) }.to_str() {
+        Ok(s) => s.to_owned(),
+        Err(_) => return QueryRouterResult::ErrInvalidParam,
+    };
+
+    let prefill_router = handles.prefill_router.clone();
+
+    let result = handles.runtime.secondary().block_on(async {
+        let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
+
+        tokio::time::timeout(timeout_duration, async {
+            if let Err(e) = prefill_router.free(&request_id_str).await {
+                tracing::warn!(
+                    request_id = %request_id_str,
+                    error = %e,
+                    "Failed to free prefill request"
+                );
+            }
+        })
+        .await
+    });
+
+    match result {
+        Ok(()) => QueryRouterResult::Ok,
+        Err(_elapsed) => {
+            tracing::warn!(
+                request_id = %request_id_str,
+                timeout_secs = BOOKKEEPING_TIMEOUT_SEC,
+                "free_prefill_request timed out"
+            );
+            QueryRouterResult::ErrTimeout
+        }
+    }
+}
+
 /// Destroy router handles
 ///
 /// # Safety
