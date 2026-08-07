@@ -40,6 +40,7 @@ use crate::{
 
 mod activation;
 mod admission;
+mod booking;
 mod conditional_bypass;
 mod query;
 
