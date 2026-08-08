@@ -1082,7 +1082,6 @@ pub unsafe extern "C" fn free_request(
 /// - `handle` must be a valid RouterHandles handle
 /// - `request_id` must be a valid null-terminated C string
 /// - `token_ids` must point to `token_count` u32 values (or be null when count is 0)
-/// - `cache_namespace` must point to `cache_namespace_len` bytes (or be null when len is 0)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn add_prefill_request(
     handle: RouterHandlesPtr,
@@ -1091,8 +1090,6 @@ pub unsafe extern "C" fn add_prefill_request(
     token_count: usize,
     worker_id: u64,
     dp_rank: u32,
-    cache_namespace: *const u8,
-    cache_namespace_len: usize,
 ) -> QueryRouterResult {
     if handle.is_null() || request_id.is_null() {
         return QueryRouterResult::ErrInvalidParam;
@@ -1103,20 +1100,6 @@ pub unsafe extern "C" fn add_prefill_request(
         Ok(s) => s.to_owned(),
         Err(_) => return QueryRouterResult::ErrInvalidParam,
     };
-    let cache_namespace = if cache_namespace_len == 0 {
-        None
-    } else if cache_namespace.is_null() {
-        return QueryRouterResult::ErrInvalidParam;
-    } else {
-        match std::str::from_utf8(unsafe {
-            std::slice::from_raw_parts(cache_namespace, cache_namespace_len)
-        }) {
-            Ok("") => None,
-            Ok(namespace) => Some(namespace.to_owned()),
-            Err(_) => return QueryRouterResult::ErrInvalidParam,
-        }
-    };
-
     let tokens: Vec<u32> = if token_count > 0 && !token_ids.is_null() {
         unsafe { std::slice::from_raw_parts(token_ids, token_count) }.to_vec()
     } else {
@@ -1131,7 +1114,7 @@ pub unsafe extern "C" fn add_prefill_request(
         tokio::time::timeout(timeout_duration, async {
             let worker = WorkerWithDpRank::new(worker_id, dp_rank);
             if let Err(e) = prefill_router
-                .add_request(request_id_str.clone(), &tokens, worker, cache_namespace.clone())
+                .add_request(request_id_str.clone(), &tokens, worker)
                 .await
             {
                 tracing::warn!(
