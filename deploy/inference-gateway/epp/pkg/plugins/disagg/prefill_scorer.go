@@ -48,10 +48,9 @@ var _ rc.ResponseBodyProcessor = &DynPrefillScorer{}
 // PrefillRoutingState holds routing information passed from Score() to PreRequest()
 // so the selected prefill worker's load can be booked, and released in ResponseBody().
 type PrefillRoutingState struct {
-	WorkerID       uint64
-	DpRank         uint32
-	TokenData      []int64
-	CacheNamespace string
+	WorkerID  uint64
+	DpRank    uint32
+	TokenData []int64
 }
 
 // Clone implements plugins.StateData.
@@ -60,9 +59,8 @@ func (s *PrefillRoutingState) Clone() plugins.StateData {
 		return nil
 	}
 	clone := &PrefillRoutingState{
-		WorkerID:       s.WorkerID,
-		DpRank:         s.DpRank,
-		CacheNamespace: s.CacheNamespace,
+		WorkerID: s.WorkerID,
+		DpRank:   s.DpRank,
 	}
 	if s.TokenData != nil {
 		clone.TokenData = make([]int64, len(s.TokenData))
@@ -172,10 +170,9 @@ func (s *DynPrefillScorer) Score(ctx context.Context, cycleState *schedtypes.Cyc
 			dpRank = 0
 		}
 		s.pluginState.Write(req.RequestId, plugins.StateKey(prefillStateKey), &PrefillRoutingState{
-			WorkerID:       result.WorkerID,
-			DpRank:         dpRank,
-			TokenData:      result.TokenData,
-			CacheNamespace: result.CacheNamespace,
+			WorkerID:  result.WorkerID,
+			DpRank:    dpRank,
+			TokenData: result.TokenData,
 		})
 	}
 
@@ -209,7 +206,6 @@ func (s *DynPrefillScorer) PreRequest(ctx context.Context, request *schedtypes.I
 		state.TokenData,
 		state.WorkerID,
 		state.DpRank,
-		state.CacheNamespace,
 	); addErr != nil {
 		logger.V(logutil.DEFAULT).Error(addErr, "DynPrefillScorer PreRequest: failed to book prefill request",
 			"requestID", request.RequestId)
