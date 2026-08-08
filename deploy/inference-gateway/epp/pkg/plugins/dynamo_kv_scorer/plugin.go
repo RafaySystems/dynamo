@@ -93,9 +93,7 @@ query_router_result_t add_prefill_request(RouterHandles *handle,
                                           const uint32_t *token_ids,
                                           size_t token_count,
                                           uint64_t worker_id,
-                                          uint32_t dp_rank,
-                                          const uint8_t *cache_namespace,
-                                          size_t cache_namespace_len);
+                                          uint32_t dp_rank);
 
 query_router_result_t free_prefill_request(RouterHandles *handle,
                                            const char *request_id);
@@ -418,7 +416,7 @@ func CallFreeRequest(requestID string) error {
 // CallAddPrefillRequest books the selected prefill worker's load with the router's
 // bookkeeping. Mirror of CallAddRequest, targeting the prefill router; released by
 // CallFreePrefillRequest at prefill completion.
-func CallAddPrefillRequest(requestID string, tokenData []int64, workerID uint64, dpRank uint32, cacheNamespace string) error {
+func CallAddPrefillRequest(requestID string, tokenData []int64, workerID uint64, dpRank uint32) error {
 	if !routerInitialized {
 		return fmt.Errorf("dynamo router not initialized")
 	}
@@ -438,11 +436,6 @@ func CallAddPrefillRequest(requestID string, tokenData []int64, workerID uint64,
 
 	cRequestID := C.CString(requestID)
 	defer C.free(unsafe.Pointer(cRequestID))
-	var cCacheNamespace *C.uint8_t
-	if cacheNamespace != "" {
-		cCacheNamespace = (*C.uint8_t)(C.CBytes([]byte(cacheNamespace)))
-		defer C.free(unsafe.Pointer(cCacheNamespace))
-	}
 
 	var cTokens *C.uint32_t
 	if len(tokens) > 0 {
@@ -456,8 +449,6 @@ func CallAddPrefillRequest(requestID string, tokenData []int64, workerID uint64,
 		C.size_t(len(tokens)),
 		C.uint64_t(workerID),
 		C.uint32_t(dpRank),
-		cCacheNamespace,
-		C.size_t(len(cacheNamespace)),
 	)
 
 	if rc != C.QUERY_ROUTER_OK {
