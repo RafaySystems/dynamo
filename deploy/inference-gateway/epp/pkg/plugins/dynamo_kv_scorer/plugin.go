@@ -88,6 +88,18 @@ query_router_result_t mark_prefill_complete(RouterHandles *handle,
 query_router_result_t free_request(RouterHandles *handle,
                                    const char *request_id);
 
+query_router_result_t add_prefill_request(RouterHandles *handle,
+                                          const char *request_id,
+                                          const uint32_t *token_ids,
+                                          size_t token_count,
+                                          uint64_t worker_id,
+                                          uint32_t dp_rank,
+                                          const uint8_t *cache_namespace,
+                                          size_t cache_namespace_len);
+
+query_router_result_t free_prefill_request(RouterHandles *handle,
+                                           const char *request_id);
+
 void free_routing_result(CRoutingResult *result);
 
 void destroy(RouterHandles *handle);
@@ -399,6 +411,81 @@ func CallFreeRequest(requestID string) error {
 	rc := C.free_request(router, cRequestID)
 	if rc != C.QUERY_ROUTER_OK {
 		return fmt.Errorf("free_request failed with code %d", rc)
+	}
+	return nil
+}
+
+// CallAddPrefillRequest books the selected prefill worker's load with the router's
+// bookkeeping. Mirror of CallAddRequest, targeting the prefill router; released by
+// CallFreePrefillRequest at prefill completion.
+func CallAddPrefillRequest(requestID string, tokenData []int64, workerID uint64, dpRank uint32, cacheNamespace string) error {
+	if !routerInitialized {
+		return fmt.Errorf("dynamo router not initialized")
+	}
+
+	routerHandlesMutex.RLock()
+	router := routerHandles
+	routerHandlesMutex.RUnlock()
+
+	if router == nil {
+		return fmt.Errorf("dynamo router handles not created")
+	}
+
+	tokens := make([]uint32, len(tokenData))
+	for i, t := range tokenData {
+		tokens[i] = uint32(t)
+	}
+
+	cRequestID := C.CString(requestID)
+	defer C.free(unsafe.Pointer(cRequestID))
+	var cCacheNamespace *C.uint8_t
+	if cacheNamespace != "" {
+		cCacheNamespace = (*C.uint8_t)(C.CBytes([]byte(cacheNamespace)))
+		defer C.free(unsafe.Pointer(cCacheNamespace))
+	}
+
+	var cTokens *C.uint32_t
+	if len(tokens) > 0 {
+		cTokens = (*C.uint32_t)(unsafe.Pointer(&tokens[0]))
+	}
+
+	rc := C.add_prefill_request(
+		router,
+		cRequestID,
+		cTokens,
+		C.size_t(len(tokens)),
+		C.uint64_t(workerID),
+		C.uint32_t(dpRank),
+		cCacheNamespace,
+		C.size_t(len(cacheNamespace)),
+	)
+
+	if rc != C.QUERY_ROUTER_OK {
+		return fmt.Errorf("add_prefill_request failed with code %d", rc)
+	}
+	return nil
+}
+
+// CallFreePrefillRequest releases a prefill-load booking made by CallAddPrefillRequest.
+func CallFreePrefillRequest(requestID string) error {
+	if !routerInitialized {
+		return fmt.Errorf("dynamo router not initialized")
+	}
+
+	routerHandlesMutex.RLock()
+	router := routerHandles
+	routerHandlesMutex.RUnlock()
+
+	if router == nil {
+		return fmt.Errorf("dynamo router handles not created")
+	}
+
+	cRequestID := C.CString(requestID)
+	defer C.free(unsafe.Pointer(cRequestID))
+
+	rc := C.free_prefill_request(router, cRequestID)
+	if rc != C.QUERY_ROUTER_OK {
+		return fmt.Errorf("free_prefill_request failed with code %d", rc)
 	}
 	return nil
 }

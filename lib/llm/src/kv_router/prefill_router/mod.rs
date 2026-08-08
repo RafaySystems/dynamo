@@ -32,6 +32,7 @@ use crate::{
 
 mod activation;
 mod admission;
+mod booking;
 mod query;
 
 use admission::InnerPrefillRouter;

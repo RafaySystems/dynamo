@@ -443,6 +443,43 @@ impl Router {
         .map_err(|_| anyhow::anyhow!("free_request timed out"))?
     }
 
+    /// Book prefill load for the selected prefill worker so subsequent prefill
+    /// selections see it as busier. Advisory (non-atomic with selection); paired
+    /// release is [`Router::free_prefill_request`].
+    pub async fn add_prefill_request(
+        &self,
+        request_id: &str,
+        tokens: &[u32],
+        worker_id: u64,
+        dp_rank: u32,
+        cache_namespace: Option<String>,
+    ) -> Result<()> {
+        let prefill_router = self.prefill_router.clone();
+        let request_id = request_id.to_owned();
+        let tokens = tokens.to_vec();
+
+        tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
+            let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+            prefill_router
+                .add_request(request_id, &tokens, worker, cache_namespace)
+                .await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("add_prefill_request timed out"))?
+    }
+
+    /// Release a prefill-load booking made by [`Router::add_prefill_request`].
+    pub async fn free_prefill_request(&self, request_id: &str) -> Result<()> {
+        let prefill_router = self.prefill_router.clone();
+        let request_id = request_id.to_owned();
+
+        tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
+            prefill_router.free(&request_id).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("free_prefill_request timed out"))?
+    }
+
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }
