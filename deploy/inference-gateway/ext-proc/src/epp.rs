@@ -452,7 +452,6 @@ impl Router {
         tokens: &[u32],
         worker_id: u64,
         dp_rank: u32,
-        cache_namespace: Option<String>,
     ) -> Result<()> {
         let prefill_router = self.prefill_router.clone();
         let request_id = request_id.to_owned();
@@ -461,7 +460,7 @@ impl Router {
         tokio::time::timeout(BOOKKEEPING_TIMEOUT, async {
             let worker = WorkerWithDpRank::new(worker_id, dp_rank);
             prefill_router
-                .add_request(request_id, &tokens, worker, cache_namespace)
+                .add_request(request_id, &tokens, worker)
                 .await
         })
         .await
