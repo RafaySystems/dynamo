@@ -37,6 +37,8 @@ mod admission;
 mod query;
 mod reservations;
 
+pub use reservations::EppReservationManager;
+
 use admission::InnerPrefillRouter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +157,6 @@ fn strip_terminal_disaggregated_params(
 /// - Normal: Worker IDs determined by router based on KV cache state
 pub struct PrefillRouter {
     prefill_router: OnceLock<InnerPrefillRouter>,
-    reservations: reservations::PrefillReservationRegistry,
     model_manager: Arc<ModelManager>,
     endpoint_id: OnceLock<EndpointId>,
     cancel_token: CancellationToken,

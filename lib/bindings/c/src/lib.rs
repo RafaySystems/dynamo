@@ -29,7 +29,7 @@ use dynamo_runtime::{DistributedRuntime, Worker};
 use dynamo_runtime::Runtime;
 
 use dynamo_llm::discovery::{ModelManager, WORKER_TYPE_DECODE};
-use dynamo_llm::kv_router::prefill_router::PrefillQueryOutcome;
+use dynamo_llm::kv_router::prefill_router::{EppReservationManager, PrefillQueryOutcome};
 use dynamo_llm::kv_router::{KvRouter, PrefillRouter};
 use dynamo_runtime::pipeline::RouterMode;
 
@@ -463,6 +463,7 @@ impl Default for CRoutingResult {
 /// Container holding routers and preprocessor for query routing
 pub struct RouterHandles {
     prefill_router: Arc<PrefillRouter>,
+    epp_reservations: Arc<EppReservationManager>,
     decode_router: Arc<KvRouter>,
     #[allow(dead_code)]
     model_manager: Arc<ModelManager>,
@@ -493,8 +494,9 @@ impl RouterHandles {
         }
 
         let outcome = self
-            .prefill_router
-            .reserve_prefill_worker(
+            .epp_reservations
+            .reserve(
+                &self.prefill_router,
                 reservation_id,
                 tokens,
                 block_mm_infos,
@@ -871,7 +873,11 @@ pub unsafe extern "C" fn create_routers(
         // to activate the PrefillRouter.
         spawn_prefill_discovery_watcher(drt.clone(), actual_namespace.clone(), prefill_tx);
 
+        let epp_reservations = Arc::new(EppReservationManager::default());
+        EppReservationManager::spawn_reaper(&epp_reservations);
+
         Ok((
+            epp_reservations,
             prefill_router,
             decode_router,
             model_manager,
@@ -881,9 +887,17 @@ pub unsafe extern "C" fn create_routers(
     });
 
     match result {
-        Ok((prefill_router, decode_router, model_manager, namespace_str, preprocessor)) => {
+        Ok((
+            epp_reservations,
+            prefill_router,
+            decode_router,
+            model_manager,
+            namespace_str,
+            preprocessor,
+        )) => {
             let handles = RouterHandles {
                 prefill_router,
+                epp_reservations,
                 decode_router,
                 model_manager,
                 namespace: namespace_str,
@@ -1071,14 +1085,14 @@ pub unsafe extern "C" fn mark_prefill_complete(
         Err(_) => return QueryRouterResult::ErrInvalidParam,
     };
 
-    let prefill_router = handles.prefill_router.clone();
+    let epp_reservations = handles.epp_reservations.clone();
     let decode_router = handles.decode_router.clone();
 
     let result = handles.runtime.secondary().block_on(async {
         let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
 
         tokio::time::timeout(timeout_duration, async {
-            if let Err(e) = prefill_router.release_prefill_reservation(&request_id_str).await {
+            if let Err(e) = epp_reservations.release(&request_id_str).await {
                 tracing::warn!(request_id = %request_id_str, error = %e, "Failed to release prefill reservation");
             }
             if let Err(e) = decode_router.mark_prefill_completed(&request_id_str).await {
@@ -1132,14 +1146,14 @@ pub unsafe extern "C" fn free_request(
         Err(_) => return QueryRouterResult::ErrInvalidParam,
     };
 
-    let prefill_router = handles.prefill_router.clone();
+    let epp_reservations = handles.epp_reservations.clone();
     let decode_router = handles.decode_router.clone();
 
     let result = handles.runtime.secondary().block_on(async {
         let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
 
         tokio::time::timeout(timeout_duration, async {
-            if let Err(e) = prefill_router.release_prefill_reservation(&request_id_str).await {
+            if let Err(e) = epp_reservations.release(&request_id_str).await {
                 tracing::warn!(request_id = %request_id_str, error = %e, "Failed to release prefill reservation");
             }
             if let Err(e) = decode_router.free(&request_id_str).await {
@@ -1434,8 +1448,8 @@ pub unsafe extern "C" fn begin_prefill_reservation(
     };
     let handles = unsafe { &*handle };
     match handles
-        .prefill_router
-        .begin_prefill_reservation(reservation_id)
+        .epp_reservations
+        .begin(&handles.prefill_router, reservation_id)
     {
         Ok(()) => QueryRouterResult::Ok,
         Err(error) => {
@@ -1478,8 +1492,8 @@ pub unsafe extern "C" fn route_prefill_request_with_reservation(
     };
     let handles = unsafe { &*handle };
     if let Err(error) = handles
-        .prefill_router
-        .begin_prefill_reservation(&reservation_id)
+        .epp_reservations
+        .begin(&handles.prefill_router, &reservation_id)
     {
         tracing::warn!(%reservation_id, %error, "Failed to begin EPP prefill reservation");
         return QueryRouterResult::ErrQueryFailed;
@@ -1488,9 +1502,7 @@ pub unsafe extern "C" fn route_prefill_request_with_reservation(
         match unsafe { preprocess_request(handles, request_json) } {
             Ok(values) => values,
             Err(code) => {
-                handles
-                    .prefill_router
-                    .abort_prefill_reservation(&reservation_id);
+                handles.epp_reservations.abort(&reservation_id);
                 return code;
             }
         };
@@ -1557,9 +1569,7 @@ pub unsafe extern "C" fn cancel_prefill_reservation(
         _ => return QueryRouterResult::ErrInvalidParam,
     };
     let handles = unsafe { &*handle };
-    handles
-        .prefill_router
-        .cancel_prefill_reservation(reservation_id);
+    handles.epp_reservations.cancel(reservation_id);
     QueryRouterResult::Ok
 }
 

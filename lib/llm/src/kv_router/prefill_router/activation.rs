@@ -49,7 +49,6 @@ impl PrefillRouter {
     ) -> Arc<Self> {
         Arc::new(Self {
             prefill_router: std::sync::OnceLock::new(),
-            reservations: Default::default(),
             model_manager,
             endpoint_id: std::sync::OnceLock::new(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -86,7 +85,6 @@ impl PrefillRouter {
 
         let router = Arc::new(Self {
             prefill_router,
-            reservations: Default::default(),
             model_manager: model_manager.clone(),
             endpoint_id: std::sync::OnceLock::new(),
             cancel_token: cancel_token.clone(),
@@ -102,7 +100,6 @@ impl PrefillRouter {
             activation_task_state: Arc::new(()),
         });
 
-        Self::spawn_reservation_reaper(&router);
         // Spawn background task to wait for activation
         let router_weak = Arc::downgrade(&router);
         #[cfg(test)]
