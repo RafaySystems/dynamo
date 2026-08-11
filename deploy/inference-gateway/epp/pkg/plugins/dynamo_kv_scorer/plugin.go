@@ -447,49 +447,6 @@ func extractCacheNamespace(result *C.CRoutingResult) string {
 	return ""
 }
 
-// CallRoutePrefillRequest routes a request to the best prefill worker.
-// It tokenizes the request and queries only the prefill router.
-func CallRoutePrefillRequest(requestJSON string, podsJSON string) (*RoutingResult, error) {
-	if !routerInitialized {
-		return nil, fmt.Errorf("dynamo router not initialized")
-	}
-
-	routerHandlesMutex.RLock()
-	router := routerHandles
-	routerHandlesMutex.RUnlock()
-	if router == nil {
-		return nil, fmt.Errorf("dynamo router handles not created")
-	}
-
-	cRequestJSON := C.CString(requestJSON)
-	defer C.free(unsafe.Pointer(cRequestJSON))
-
-	var cPodsJSON *C.char
-	if podsJSON != "" {
-		cPodsJSON = C.CString(podsJSON)
-		defer C.free(unsafe.Pointer(cPodsJSON))
-	}
-
-	var result C.CRoutingResult
-	rc := C.route_prefill_request(router, cRequestJSON, cPodsJSON, &result)
-	if rc != C.QUERY_ROUTER_OK {
-		return nil, fmt.Errorf("route_prefill_request failed with code %d", rc)
-	}
-
-	tokens := extractTokenData(&result)
-	cacheNamespace := extractCacheNamespace(&result)
-	workerID := uint64(result.prefill_worker_id)
-	dpRank := uint32(result.prefill_dp_rank)
-	C.free_routing_result(&result)
-
-	return &RoutingResult{
-		WorkerID:       workerID,
-		DpRank:         dpRank,
-		TokenData:      tokens,
-		CacheNamespace: cacheNamespace,
-	}, nil
-}
-
 // CallRoutePrefillRequestWithReservation atomically selects and books a prefill worker.
 // The Rust scheduler retracts pending admission when timeout expires.
 func CallRoutePrefillRequestWithReservation(reservationID string, requestJSON string, podsJSON string, timeout time.Duration) (*RoutingResult, error) {
