@@ -18,10 +18,11 @@ REGISTRY    ?= registry.dev.rafay-edge.net/tf
 
 # Upstream frontend image the fix is overlaid onto.
 BASE_IMAGE  ?= nvcr.io/nvidia/ai-dynamo/dynamo-frontend:$(VERSION)
-# Local intermediate EPP image (not pushed).
-EPP_IMAGE   ?= dynamo-epp:$(VERSION)-tool-fix
+# Local intermediate EPP image (not pushed). Suffix matches IMAGE so local
+# rebuilds don't collide with an older tool-fix-only EPP tag.
+EPP_IMAGE   ?= dynamo-epp:$(VERSION)-tool-fix-telus
 # Final pushed image (drop-in replacement for the frontend/EPP pod).
-IMAGE       ?= $(REGISTRY)/dynamo-frontend:$(VERSION)-tool-fix
+IMAGE       ?= $(REGISTRY)/dynamo-frontend:$(VERSION)-tool-fix-telus
 
 COMMIT_SHA  := $(shell git -C $(REPO_ROOT) rev-parse HEAD 2>/dev/null)
 BUILD_REF   := $(shell git -C $(REPO_ROOT) rev-parse --abbrev-ref HEAD 2>/dev/null)
