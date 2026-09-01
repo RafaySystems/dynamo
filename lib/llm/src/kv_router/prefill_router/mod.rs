@@ -35,6 +35,9 @@ use crate::{
 mod activation;
 mod admission;
 mod query;
+mod reservations;
+
+pub use reservations::EppReservationManager;
 
 use admission::InnerPrefillRouter;
 

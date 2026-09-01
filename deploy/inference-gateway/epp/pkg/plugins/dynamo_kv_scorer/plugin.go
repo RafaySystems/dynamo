@@ -41,6 +41,7 @@ enum {
     QUERY_ROUTER_ERR_QUERY_FAILED = 4,
     QUERY_ROUTER_ERR_DISAGG_ENFORCED = 5,
     QUERY_ROUTER_ERR_TIMEOUT = 6,
+    QUERY_ROUTER_ERR_BACKPRESSURE = 7,
 };
 
 // opaque handle forward-decl for Router bindings
@@ -66,10 +67,25 @@ query_router_result_t create_routers(const char *namespace_c_str,
                                      bool enforce_disagg,
                                      RouterHandles **out_handle);
 
+query_router_result_t begin_prefill_reservation(RouterHandles *handle,
+                                                const char *reservation_id);
+
 query_router_result_t route_prefill_request(RouterHandles *handle,
                                             const char *request_json,
                                             const char *pods_json,
                                             CRoutingResult *out_result);
+
+query_router_result_t route_prefill_request_with_reservation(RouterHandles *handle,
+                                                             const char *reservation_id,
+                                                             const char *request_json,
+                                                             const char *pods_json,
+                                                             CRoutingResult *out_result);
+
+query_router_result_t cancel_prefill_reservation(RouterHandles *handle,
+                                                  const char *reservation_id);
+
+query_router_result_t release_prefill_reservation(RouterHandles *handle,
+                                                   const char *reservation_id);
 
 query_router_result_t route_decode_request(RouterHandles *handle,
                                            const char *request_json,
@@ -101,6 +117,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -282,92 +299,32 @@ func SerializeEndpointsToJSON(endpoints []schedtypes.Endpoint) (string, error) {
 	return string(data), nil
 }
 
-func BuildOpenAIRequest(req *schedtypes.InferenceRequest) (map[string]any, error) {
-	requestBody := make(map[string]any)
-
+// BuildOpenAIRequestJSON forwards the full request body (req.Body.Payload) to
+// the Rust router's FFI, overriding only the model, so tool-calling and
+// reasoning fields survive the router's parse and chat-template render. Errors
+// when no payload is available so the scorer falls back to non-KV routing.
+func BuildOpenAIRequestJSON(req *schedtypes.InferenceRequest) (string, error) {
 	if req == nil || req.Body == nil {
-		return nil, fmt.Errorf("missing request body")
+		return "", fmt.Errorf("missing request body")
 	}
 
-	if req.Body.ChatCompletions != nil && len(req.Body.ChatCompletions.Messages) > 0 {
-		messages := make([]map[string]any, 0, len(req.Body.ChatCompletions.Messages))
-		anyNonEmpty := false
-		for _, msg := range req.Body.ChatCompletions.Messages {
-			content := msg.Content.PlainText()
-			if strings.TrimSpace(content) != "" {
-				anyNonEmpty = true
-			}
-			messages = append(messages, map[string]any{
-				"role":    msg.Role,
-				"content": content,
-			})
-		}
-		if !anyNonEmpty {
-			return nil, fmt.Errorf("empty chat messages")
-		}
-		requestBody["messages"] = messages
-	} else if req.Body.Completions != nil && !req.Body.Completions.Prompt.IsEmpty() {
-		addCompletionPrompt(requestBody, req.Body.Completions.Prompt)
-	} else {
-		return nil, fmt.Errorf("no messages or prompt provided")
+	pm, ok := req.Body.Payload.(fwkrh.PayloadMap)
+	if !ok || len(pm) == 0 {
+		return "", fmt.Errorf("request payload unavailable; cannot build KV-routing request")
 	}
 
+	requestBody := make(map[string]any, len(pm))
+	maps.Copy(requestBody, pm)
+	// Route on the resolved target model.
 	if strings.TrimSpace(req.TargetModel) != "" {
 		requestBody["model"] = req.TargetModel
-	} else {
-		requestBody["model"] = "default"
 	}
 
-	// Forward the caller's nvext block so the Rust router can lift
-	// nvext.agent_hints.priority into priority_jump.
-	if nvext := extractNvext(req.Body.Payload); nvext != nil {
-		requestBody["nvext"] = nvext
+	data, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request JSON: %w", err)
 	}
-	if cacheSalt := extractTopLevelCacheSalt(req.Body.Payload); cacheSalt != "" {
-		requestBody["cache_salt"] = cacheSalt
-	}
-
-	return requestBody, nil
-}
-
-func addCompletionPrompt(requestBody map[string]any, prompt fwkrh.Prompt) {
-	if len(prompt.TokenIDs) > 0 {
-		tokenIDs := make([]uint32, len(prompt.TokenIDs))
-		copy(tokenIDs, prompt.TokenIDs)
-		requestBody["prompt"] = tokenIDs
-		return
-	}
-
-	// Keep non-token completions on the legacy chat-shaped scorer path.
-	requestBody["messages"] = []map[string]any{
-		{
-			"role":    "user",
-			"content": prompt.PlainText(),
-		},
-	}
-}
-
-// extractNvext returns the caller-supplied nvext object from the PayloadMap,
-// or nil when the payload is not a map or does not contain an nvext object.
-//
-// This is how routing hints — most notably nvext.agent_hints.priority — reach
-// the Rust router via the FFI JSON.
-func extractNvext(payload fwkrh.RequestPayload) map[string]any {
-	pm, ok := payload.(fwkrh.PayloadMap)
-	if !ok {
-		return nil
-	}
-	nvext, _ := pm["nvext"].(map[string]any)
-	return nvext
-}
-
-func extractTopLevelCacheSalt(payload fwkrh.RequestPayload) string {
-	pm, ok := payload.(fwkrh.PayloadMap)
-	if !ok {
-		return ""
-	}
-	cacheSalt, _ := pm["cache_salt"].(string)
-	return cacheSalt
+	return string(data), nil
 }
 
 // CallAddRequest registers a request with the router's bookkeeping.
@@ -498,9 +455,40 @@ func extractCacheNamespace(result *C.CRoutingResult) string {
 	return ""
 }
 
-// CallRoutePrefillRequest routes a request to the best prefill worker.
-// It tokenizes the request and queries only the prefill router.
-func CallRoutePrefillRequest(requestJSON string, podsJSON string) (*RoutingResult, error) {
+// CallBeginPrefillReservation records a pending booking before the blocking
+// route call performs request preprocessing. It is fast and safe to call before
+// starting the reservation goroutine.
+func CallBeginPrefillReservation(reservationID string) error {
+	if reservationID == "" {
+		return fmt.Errorf("prefill reservation ID is required")
+	}
+	if !routerInitialized {
+		return fmt.Errorf("dynamo router not initialized")
+	}
+
+	routerHandlesMutex.RLock()
+	router := routerHandles
+	routerHandlesMutex.RUnlock()
+	if router == nil {
+		return fmt.Errorf("dynamo router handles not created")
+	}
+
+	cReservationID := C.CString(reservationID)
+	defer C.free(unsafe.Pointer(cReservationID))
+
+	rc := C.begin_prefill_reservation(router, cReservationID)
+	if rc != C.QUERY_ROUTER_OK {
+		return fmt.Errorf("begin_prefill_reservation failed with code %d", rc)
+	}
+	return nil
+}
+
+// CallRoutePrefillRequestWithReservation atomically selects and books a prefill worker.
+// The caller cancels pending admission through CallCancelPrefillReservation.
+func CallRoutePrefillRequestWithReservation(reservationID string, requestJSON string, podsJSON string) (*RoutingResult, error) {
+	if reservationID == "" {
+		return nil, fmt.Errorf("prefill reservation ID is required")
+	}
 	if !routerInitialized {
 		return nil, fmt.Errorf("dynamo router not initialized")
 	}
@@ -512,6 +500,8 @@ func CallRoutePrefillRequest(requestJSON string, podsJSON string) (*RoutingResul
 		return nil, fmt.Errorf("dynamo router handles not created")
 	}
 
+	cReservationID := C.CString(reservationID)
+	defer C.free(unsafe.Pointer(cReservationID))
 	cRequestJSON := C.CString(requestJSON)
 	defer C.free(unsafe.Pointer(cRequestJSON))
 
@@ -522,9 +512,15 @@ func CallRoutePrefillRequest(requestJSON string, podsJSON string) (*RoutingResul
 	}
 
 	var result C.CRoutingResult
-	rc := C.route_prefill_request(router, cRequestJSON, cPodsJSON, &result)
+	rc := C.route_prefill_request_with_reservation(
+		router,
+		cReservationID,
+		cRequestJSON,
+		cPodsJSON,
+		&result,
+	)
 	if rc != C.QUERY_ROUTER_OK {
-		return nil, fmt.Errorf("route_prefill_request failed with code %d", rc)
+		return nil, fmt.Errorf("route_prefill_request_with_reservation failed with code %d", rc)
 	}
 
 	tokens := extractTokenData(&result)
@@ -541,8 +537,63 @@ func CallRoutePrefillRequest(requestJSON string, podsJSON string) (*RoutingResul
 	}, nil
 }
 
+// CallCancelPrefillReservation cancels a pending prefill reservation without waiting for
+// scheduler cleanup. It is safe to call concurrently with the blocking reservation call.
+func CallCancelPrefillReservation(reservationID string) error {
+	if reservationID == "" {
+		return fmt.Errorf("prefill reservation ID is required")
+	}
+	if !routerInitialized {
+		return fmt.Errorf("dynamo router not initialized")
+	}
+
+	routerHandlesMutex.RLock()
+	router := routerHandles
+	routerHandlesMutex.RUnlock()
+	if router == nil {
+		return fmt.Errorf("dynamo router handles not created")
+	}
+
+	cReservationID := C.CString(reservationID)
+	defer C.free(unsafe.Pointer(cReservationID))
+
+	rc := C.cancel_prefill_reservation(router, cReservationID)
+	if rc != C.QUERY_ROUTER_OK {
+		return fmt.Errorf("cancel_prefill_reservation failed with code %d", rc)
+	}
+	return nil
+}
+
+// CallReleasePrefillReservation releases only the EPP prefill reservation.
+// It does not remove a decode booking that aggregate fallback may have installed.
+func CallReleasePrefillReservation(reservationID string) error {
+	if reservationID == "" {
+		return fmt.Errorf("prefill reservation ID is required")
+	}
+	if !routerInitialized {
+		return fmt.Errorf("dynamo router not initialized")
+	}
+
+	routerHandlesMutex.RLock()
+	router := routerHandles
+	routerHandlesMutex.RUnlock()
+	if router == nil {
+		return fmt.Errorf("dynamo router handles not created")
+	}
+
+	cReservationID := C.CString(reservationID)
+	defer C.free(unsafe.Pointer(cReservationID))
+
+	rc := C.release_prefill_reservation(router, cReservationID)
+	if rc != C.QUERY_ROUTER_OK {
+		return fmt.Errorf("release_prefill_reservation failed with code %d", rc)
+	}
+	return nil
+}
+
 // CallRouteDecodeRequest routes a request to the best decode worker.
 // When isDisaggregated is true, overlap_score_credit=0 is used (KV cache transferred from prefill).
+
 func CallRouteDecodeRequest(requestJSON string, podsJSON string, isDisaggregated bool) (*RoutingResult, error) {
 	if !routerInitialized {
 		return nil, fmt.Errorf("dynamo router not initialized")

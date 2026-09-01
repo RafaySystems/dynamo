@@ -29,7 +29,7 @@ use dynamo_runtime::{DistributedRuntime, Worker};
 use dynamo_runtime::Runtime;
 
 use dynamo_llm::discovery::{ModelManager, WORKER_TYPE_DECODE};
-use dynamo_llm::kv_router::prefill_router::PrefillQueryOutcome;
+use dynamo_llm::kv_router::prefill_router::{EppReservationManager, PrefillQueryOutcome};
 use dynamo_llm::kv_router::{KvRouter, PrefillRouter};
 use dynamo_runtime::pipeline::RouterMode;
 
@@ -463,6 +463,7 @@ impl Default for CRoutingResult {
 /// Container holding routers and preprocessor for query routing
 pub struct RouterHandles {
     prefill_router: Arc<PrefillRouter>,
+    epp_reservations: Arc<EppReservationManager>,
     decode_router: Arc<KvRouter>,
     #[allow(dead_code)]
     model_manager: Arc<ModelManager>,
@@ -475,13 +476,11 @@ pub struct RouterHandles {
 }
 
 impl RouterHandles {
-    /// Query optimal prefill worker for a request.
-    ///
-    /// When `allowed_worker_ids` is Some, only workers in that set are considered.
-    /// Returns worker_id on success.
+    /// Atomically select and reserve a prefill worker for an EPP-owned booking.
     #[expect(clippy::too_many_arguments)]
-    async fn query_prefill_worker(
+    async fn reserve_prefill_worker(
         &self,
+        reservation_id: &str,
         tokens: &[u32],
         block_mm_infos: Option<&[Option<dynamo_kv_router::protocols::BlockExtraInfo>]>,
         lora_name: Option<String>,
@@ -496,8 +495,10 @@ impl RouterHandles {
         }
 
         let outcome = self
-            .prefill_router
-            .query_prefill_worker(
+            .epp_reservations
+            .reserve(
+                &self.prefill_router,
+                reservation_id,
                 tokens,
                 block_mm_infos,
                 lora_name,
@@ -508,20 +509,20 @@ impl RouterHandles {
                 routing_constraints,
             )
             .await
-            .map_err(|e| {
-                tracing::error!(error = ?e, "Prefill query failed");
+            .map_err(|error| {
+                tracing::error!(%reservation_id, %error, "Prefill reservation failed");
                 QueryRouterResult::ErrQueryFailed
             })?;
         match outcome {
-            // Advisory only: the external caller owns dispatch and lifecycle state.
             PrefillQueryOutcome::Routed { worker_id, dp_rank } => Ok((worker_id, dp_rank)),
             PrefillQueryOutcome::QueueRejected { rejection } => {
                 tracing::warn!(
+                    %reservation_id,
                     policy_class = %rejection.policy_class,
                     limit_kind = %rejection.limit_kind,
                     current = rejection.current,
                     limit = rejection.limit,
-                    "Prefill query rejected by policy-class queue limit"
+                    "Prefill reservation rejected by policy-class queue limit"
                 );
                 Err(QueryRouterResult::ErrBackpressure)
             }
@@ -874,7 +875,11 @@ pub unsafe extern "C" fn create_routers(
         // to activate the PrefillRouter.
         spawn_prefill_discovery_watcher(drt.clone(), actual_namespace.clone(), prefill_tx);
 
+        let epp_reservations = Arc::new(EppReservationManager::default());
+        EppReservationManager::spawn_reaper(&epp_reservations);
+
         Ok((
+            epp_reservations,
             prefill_router,
             decode_router,
             model_manager,
@@ -884,9 +889,17 @@ pub unsafe extern "C" fn create_routers(
     });
 
     match result {
-        Ok((prefill_router, decode_router, model_manager, namespace_str, preprocessor)) => {
+        Ok((
+            epp_reservations,
+            prefill_router,
+            decode_router,
+            model_manager,
+            namespace_str,
+            preprocessor,
+        )) => {
             let handles = RouterHandles {
                 prefill_router,
+                epp_reservations,
                 decode_router,
                 model_manager,
                 namespace: namespace_str,
@@ -1073,12 +1086,16 @@ pub unsafe extern "C" fn mark_prefill_complete(
         Err(_) => return QueryRouterResult::ErrInvalidParam,
     };
 
+    let epp_reservations = handles.epp_reservations.clone();
     let decode_router = handles.decode_router.clone();
 
     let result = handles.runtime.secondary().block_on(async {
         let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
 
         tokio::time::timeout(timeout_duration, async {
+            if let Err(e) = epp_reservations.release(&request_id_str).await {
+                tracing::warn!(request_id = %request_id_str, error = %e, "Failed to release prefill reservation");
+            }
             if let Err(e) = decode_router.mark_prefill_completed(&request_id_str).await {
                 tracing::warn!(
                     request_id = %request_id_str,
@@ -1108,6 +1125,54 @@ pub unsafe extern "C" fn mark_prefill_complete(
     }
 }
 
+/// Release only the prefill reservation for an EPP-owned booking.
+///
+/// This is used when a cancelled prefill admission completes after the request
+/// has already fallen back to aggregate decode routing. It must not free any
+/// decode booking that the fallback path may have installed.
+///
+/// # Safety
+/// - `handle` must be a valid RouterHandles handle
+/// - `request_id` must be a valid non-empty null-terminated UTF-8 string
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn release_prefill_reservation(
+    handle: RouterHandlesPtr,
+    request_id: *const c_char,
+) -> QueryRouterResult {
+    if handle.is_null() || request_id.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    }
+
+    let handles = unsafe { &*handle };
+    let request_id = match unsafe { CStr::from_ptr(request_id) }.to_str() {
+        Ok(value) if !value.is_empty() => value.to_owned(),
+        _ => return QueryRouterResult::ErrInvalidParam,
+    };
+    let epp_reservations = handles.epp_reservations.clone();
+    let result = handles.runtime.secondary().block_on(async {
+        tokio::time::timeout(Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC), async {
+            epp_reservations.release(&request_id).await
+        })
+        .await
+    });
+
+    match result {
+        Ok(Ok(())) => QueryRouterResult::Ok,
+        Ok(Err(error)) => {
+            tracing::warn!(%request_id, %error, "Failed to release EPP prefill reservation");
+            QueryRouterResult::ErrQueryFailed
+        }
+        Err(_) => {
+            tracing::warn!(
+                %request_id,
+                timeout_secs = BOOKKEEPING_TIMEOUT_SEC,
+                "release_prefill_reservation timed out"
+            );
+            QueryRouterResult::ErrTimeout
+        }
+    }
+}
+
 /// Free a request from the router's bookkeeping.
 ///
 /// Call this when the stream is closed (completed or cancelled) to release all resources.
@@ -1130,12 +1195,16 @@ pub unsafe extern "C" fn free_request(
         Err(_) => return QueryRouterResult::ErrInvalidParam,
     };
 
+    let epp_reservations = handles.epp_reservations.clone();
     let decode_router = handles.decode_router.clone();
 
     let result = handles.runtime.secondary().block_on(async {
         let timeout_duration = Duration::from_secs(BOOKKEEPING_TIMEOUT_SEC);
 
         tokio::time::timeout(timeout_duration, async {
+            if let Err(e) = epp_reservations.release(&request_id_str).await {
+                tracing::warn!(request_id = %request_id_str, error = %e, "Failed to release prefill reservation");
+            }
             if let Err(e) = decode_router.free(&request_id_str).await {
                 tracing::warn!(
                     request_id = %request_id_str,
@@ -1404,73 +1473,118 @@ fn write_cache_namespace_to_result(cache_namespace: Option<&str>, out: &mut CRou
     std::mem::forget(namespace_boxed);
 }
 
-/// Route a request to select the best **prefill** worker only.
+/// Register a prefill booking before potentially slow request preprocessing.
 ///
-/// This is used in disaggregated mode where the EPP runs separate prefill and decode
-/// scoring profiles.  It tokenizes the request and queries only the prefill router.
-///
-/// The returned `CRoutingResult` contains:
-/// - `prefill_worker_id`: the selected prefill worker
-/// - `decode_worker_id`: 0 (unused — decode is handled by `route_decode_request`)
-/// - `is_disaggregated`: always true (this function is only called in disagg mode)
-/// - `token_ids` / `token_count`: the tokenized request (caller must free via `free_routing_result`)
+/// This is intentionally synchronous and lock-only: Go calls it before it starts
+/// the blocking route operation, so cancellation always observes an actual Pending
+/// entry rather than relying on a timed tombstone.
 ///
 /// # Safety
 /// - `handle` must be a valid RouterHandles handle
+/// - `reservation_id` must be a non-empty null-terminated UTF-8 string
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn begin_prefill_reservation(
+    handle: RouterHandlesPtr,
+    reservation_id: *const c_char,
+) -> QueryRouterResult {
+    if handle.is_null() || reservation_id.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    }
+
+    let reservation_id = match unsafe { CStr::from_ptr(reservation_id) }.to_str() {
+        Ok(value) if !value.is_empty() => value,
+        _ => return QueryRouterResult::ErrInvalidParam,
+    };
+    let handles = unsafe { &*handle };
+    match handles
+        .epp_reservations
+        .begin(&handles.prefill_router, reservation_id)
+    {
+        Ok(()) => QueryRouterResult::Ok,
+        Err(error) => {
+            tracing::warn!(%reservation_id, %error, "Failed to begin EPP prefill reservation");
+            QueryRouterResult::ErrQueryFailed
+        }
+    }
+}
+
+/// Atomically select and reserve the best prefill worker for an EPP-owned booking.
+///
+/// Cancellation drops the scheduling future. Release/1.3.0 skips a cancelled queued
+/// admission when it is subsequently dequeued.
+///
+/// # Safety
+/// - `handle` must be a valid RouterHandles handle
+/// - `reservation_id` must be a non-empty null-terminated UTF-8 string
 /// - `request_json` must be a valid null-terminated C string containing JSON
 /// - `pods_json` must be a valid null-terminated C string containing JSON, or null
 /// - `out_result` must be a valid pointer
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn route_prefill_request(
+pub unsafe extern "C" fn route_prefill_request_with_reservation(
     handle: RouterHandlesPtr,
+    reservation_id: *const c_char,
     request_json: *const c_char,
     pods_json: *const c_char,
     out_result: *mut CRoutingResult,
 ) -> QueryRouterResult {
-    if handle.is_null() || request_json.is_null() || out_result.is_null() {
+    if handle.is_null()
+        || reservation_id.is_null()
+        || request_json.is_null()
+        || out_result.is_null()
+    {
         return QueryRouterResult::ErrInvalidParam;
     }
 
+    let reservation_id = match unsafe { CStr::from_ptr(reservation_id) }.to_str() {
+        Ok(value) if !value.is_empty() => value.to_owned(),
+        _ => return QueryRouterResult::ErrInvalidParam,
+    };
     let handles = unsafe { &*handle };
-
+    if let Err(error) = handles
+        .epp_reservations
+        .begin(&handles.prefill_router, &reservation_id)
+    {
+        tracing::warn!(%reservation_id, %error, "Failed to begin EPP prefill reservation");
+        return QueryRouterResult::ErrQueryFailed;
+    }
     let (tokens, cache_namespace, priority_jump, strict_priority, routing_constraints) =
         match unsafe { preprocess_request(handles, request_json) } {
-            Ok(t) => t,
-            Err(code) => return code,
+            Ok(values) => values,
+            Err(code) => {
+                handles.epp_reservations.abort(&reservation_id);
+                return code;
+            }
         };
-
     let allowed_worker_ids = unsafe { parse_pods_filter(pods_json) };
 
-    let result = handles.runtime.secondary().block_on(async {
-        let (prefill_worker_id, prefill_dp_rank) = handles
-            .query_prefill_worker(
-                &tokens,
-                None,
-                None,
-                cache_namespace.clone(),
-                priority_jump,
-                strict_priority,
-                allowed_worker_ids,
-                routing_constraints,
-            )
-            .await?;
-
-        let prefill_dp_rank = prefill_dp_rank.unwrap_or(u32::MAX);
-
-        tracing::info!(
-            prefill_worker_id = prefill_worker_id,
-            prefill_dp_rank = prefill_dp_rank,
-            token_count = tokens.len(),
+    let result = handles
+        .runtime
+        .secondary()
+        .block_on(handles.reserve_prefill_worker(
+            &reservation_id,
+            &tokens,
+            None,
+            None,
+            cache_namespace.clone(),
             priority_jump,
             strict_priority,
-            "Routed prefill request"
-        );
-
-        Ok((prefill_worker_id, prefill_dp_rank))
-    });
+            allowed_worker_ids,
+            routing_constraints,
+        ));
 
     match result {
         Ok((prefill_worker_id, prefill_dp_rank)) => {
+            let prefill_dp_rank = prefill_dp_rank.unwrap_or(u32::MAX);
+            tracing::info!(
+                %reservation_id,
+                prefill_worker_id,
+                prefill_dp_rank,
+                token_count = tokens.len(),
+                priority_jump,
+                strict_priority,
+                "Reserved prefill request"
+            );
+
             let out = unsafe { &mut *out_result };
             *out = CRoutingResult::default();
             out.is_disaggregated = true;
@@ -1482,6 +1596,32 @@ pub unsafe extern "C" fn route_prefill_request(
         }
         Err(code) => code,
     }
+}
+
+/// Signal cancellation for a pending EPP prefill reservation.
+///
+/// This function never waits for scheduler admission or booking cleanup. If admission has
+/// already succeeded, normal request cleanup (or the Go late-result drain) owns release.
+///
+/// # Safety
+/// - `handle` must be a valid RouterHandles handle
+/// - `reservation_id` must be a valid non-empty null-terminated UTF-8 string
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cancel_prefill_reservation(
+    handle: RouterHandlesPtr,
+    reservation_id: *const c_char,
+) -> QueryRouterResult {
+    if handle.is_null() || reservation_id.is_null() {
+        return QueryRouterResult::ErrInvalidParam;
+    }
+
+    let reservation_id = match unsafe { CStr::from_ptr(reservation_id) }.to_str() {
+        Ok(value) if !value.is_empty() => value,
+        _ => return QueryRouterResult::ErrInvalidParam,
+    };
+    let handles = unsafe { &*handle };
+    handles.epp_reservations.cancel(reservation_id);
+    QueryRouterResult::Ok
 }
 
 /// Route a request to select the best **decode** worker only.
