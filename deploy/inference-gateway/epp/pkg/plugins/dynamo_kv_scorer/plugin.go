@@ -524,14 +524,16 @@ func CallRoutePrefillRequestWithReservation(reservationID string, requestJSON st
 	}
 
 	tokens := extractTokenData(&result)
+	cacheNamespace := extractCacheNamespace(&result)
 	workerID := uint64(result.prefill_worker_id)
 	dpRank := uint32(result.prefill_dp_rank)
 	C.free_routing_result(&result)
 
 	return &RoutingResult{
-		WorkerID:  workerID,
-		DpRank:    dpRank,
-		TokenData: tokens,
+		WorkerID:       workerID,
+		DpRank:         dpRank,
+		TokenData:      tokens,
+		CacheNamespace: cacheNamespace,
 	}, nil
 }
 

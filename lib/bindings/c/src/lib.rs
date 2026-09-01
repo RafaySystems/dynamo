@@ -484,6 +484,7 @@ impl RouterHandles {
         tokens: &[u32],
         block_mm_infos: Option<&[Option<dynamo_kv_router::protocols::BlockExtraInfo>]>,
         lora_name: Option<String>,
+        cache_namespace: Option<String>,
         priority_jump: f64,
         strict_priority: u32,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -501,6 +502,7 @@ impl RouterHandles {
                 tokens,
                 block_mm_infos,
                 lora_name,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 allowed_worker_ids,
@@ -995,7 +997,6 @@ pub unsafe extern "C" fn add_request_with_cache_namespace(
         Vec::new()
     };
 
-    let prefill_router = handles.prefill_router.clone();
     let decode_router = handles.decode_router.clone();
 
     let result = handles.runtime.secondary().block_on(async {
@@ -1546,7 +1547,7 @@ pub unsafe extern "C" fn route_prefill_request_with_reservation(
         tracing::warn!(%reservation_id, %error, "Failed to begin EPP prefill reservation");
         return QueryRouterResult::ErrQueryFailed;
     }
-    let (tokens, priority_jump, strict_priority, routing_constraints) =
+    let (tokens, cache_namespace, priority_jump, strict_priority, routing_constraints) =
         match unsafe { preprocess_request(handles, request_json) } {
             Ok(values) => values,
             Err(code) => {
@@ -1564,6 +1565,7 @@ pub unsafe extern "C" fn route_prefill_request_with_reservation(
             &tokens,
             None,
             None,
+            cache_namespace.clone(),
             priority_jump,
             strict_priority,
             allowed_worker_ids,
@@ -1589,6 +1591,7 @@ pub unsafe extern "C" fn route_prefill_request_with_reservation(
             out.prefill_worker_id = prefill_worker_id;
             out.prefill_dp_rank = prefill_dp_rank;
             write_tokens_to_result(&tokens, out);
+            write_cache_namespace_to_result(cache_namespace.as_deref(), out);
             QueryRouterResult::Ok
         }
         Err(code) => code,
