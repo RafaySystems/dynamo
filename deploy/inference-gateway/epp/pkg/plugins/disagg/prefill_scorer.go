@@ -139,6 +139,13 @@ func (s *DynPrefillScorer) beginReservation(bookingID string) error {
 	return s.beginPrefill(bookingID)
 }
 
+func (s *DynPrefillScorer) cancelReservation(bookingID string) error {
+	if s.cancelPrefill == nil {
+		return fmt.Errorf("prefill reservation cancellation is not configured")
+	}
+	return s.cancelPrefill(bookingID)
+}
+
 func (s *DynPrefillScorer) releaseLatePrefillReservation(bookingID string) error {
 	if s.releasePrefill == nil {
 		return fmt.Errorf("prefill reservation release is not configured")
@@ -226,7 +233,7 @@ func (s *DynPrefillScorer) Score(ctx context.Context, cycleState *schedtypes.Cyc
 	case <-admissionCtx.Done():
 		logger.V(logutil.VERBOSE).Info("DynPrefillScorer: scheduling cancelled during prefill reservation",
 			"error", admissionCtx.Err().Error())
-		if cancelErr := s.cancelPrefill(bookingID); cancelErr != nil {
+		if cancelErr := s.cancelReservation(bookingID); cancelErr != nil {
 			logger.V(logutil.DEFAULT).Error(cancelErr, "DynPrefillScorer: failed to cancel pending prefill reservation",
 				"bookingID", bookingID)
 		}
