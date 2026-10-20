@@ -91,7 +91,7 @@ from collections import deque
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from itertools import count
+from itertools import chain, count
 from typing import TYPE_CHECKING, cast
 
 import msgspec.structs
@@ -1544,57 +1544,22 @@ class InstrumentedScheduler(AsyncScheduler):
         return scheduled.num_decode_requests > 0
 
     def _compute_queued(self) -> QueuedRequestMetrics:
-        """Single-pass aggregation over ``self.waiting`` and ``self.skipped_waiting``.
-
-        vLLM's scheduler parks requests in two queues:
-
-        * ``self.waiting`` holds requests in ``WAITING`` (new, never scheduled)
-          and ``PREEMPTED`` (were decoding, evicted back for memory) states.
-        * ``self.skipped_waiting`` holds "blocked-waiting" requests awaiting an
-          async precondition — see ``Scheduler._is_blocked_waiting_status`` /
-          ``Scheduler._enqueue_waiting_request``:
-
-              WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
-                                          -- grammar/structured-output compile
-                                          -- WAITING_FOR_FSM on older vLLM
-              WAITING_FOR_REMOTE_KVS      -- disagg decode-engine KV transfer
-              WAITING_FOR_STREAMING_REQ   -- streaming request handshake
-
-        A ``WAITING_FOR_REMOTE_KVS`` request is a **decode** request: the
-        prefill engine has already computed its KV and is transferring it; once
-        finished the request goes straight to decode without a local prefill
-        step. ``num_computed_tokens`` is pre-set to the transferred KV length
-        (see ``Scheduler.schedule`` at the ``load_kv_async`` branch), so it is
-        the correct decode-KV-context value for FPM purposes.
-
-        ``WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`` /
-        ``WAITING_FOR_STREAMING_REQ`` have no KV computed yet — they are queued
-        prefill requests blocked on a precondition.
-
-        Only iterating ``self.waiting`` (the previous behaviour) silently
-        misses every ``WAITING_FOR_REMOTE_KVS`` request on the decode engine
-        in disaggregated serving, and misclassifies it as queued prefill if it
-        ever transiently appears in ``self.waiting``.
-        """
+        """Classify requests across vLLM's waiting queues by their next work."""
         prefill = WelfordAccumulator()
         decode_kv = WelfordAccumulator()
+        # vLLM 0.31 splits waiting queues by whether requests hold KV blocks.
+        if hasattr(self, "kv_holding_waiting"):
+            other_waiting = self.kv_holding_waiting
+        else:
+            other_waiting = self.skipped_waiting
 
-        for request in self.waiting:
-            if request.status == RequestStatus.PREEMPTED:
+        for request in chain(self.waiting, other_waiting):
+            if request.status in (
+                RequestStatus.PREEMPTED,
+                RequestStatus.WAITING_FOR_REMOTE_KVS,
+            ):
                 decode_kv.add(request.num_computed_tokens)
             else:
-                prefill.add(request.num_tokens)
-
-        for request in self.skipped_waiting:
-            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                # Disagg decode side: KV already computed on the prefill
-                # engine and being transferred. Next schedule() step will
-                # start generating -- count as queued decode.
-                decode_kv.add(request.num_computed_tokens)
-            else:
-                # Structured-output waits / WAITING_FOR_STREAMING_REQ:
-                # no KV yet, essentially a queued prefill awaiting a
-                # precondition.
                 prefill.add(request.num_tokens)
 
         return QueuedRequestMetrics(
@@ -1605,6 +1570,10 @@ class InstrumentedScheduler(AsyncScheduler):
             sum_decode_kv_tokens=decode_kv.s,
             var_decode_kv_tokens=decode_kv.variance(),
         )
+
+    # ------------------------------------------------------------------
+    # State cleanup
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # State cleanup
@@ -2232,7 +2201,11 @@ class InstrumentedScheduler(AsyncScheduler):
                 continue
 
             blocks = math.ceil(num_tokens / block_size)
-            admission_cap = getattr(manager, "_max_admission_blocks_per_request", None)
+            # vLLM 0.31 renamed the attribute; fall back for older versions.
+            if hasattr(manager, "max_admission_blocks_per_request"):
+                admission_cap = manager.max_admission_blocks_per_request
+            else:
+                admission_cap = getattr(manager, "_max_admission_blocks_per_request", None)
             if (
                 apply_admission_cap
                 and isinstance(admission_cap, int)

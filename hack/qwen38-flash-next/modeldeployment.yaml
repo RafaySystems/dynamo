@@ -1,0 +1,67 @@
+# gaap ModelDeployment for Qwen3.8-Flash-Next-FP8 on 8x H200, aggregated (TEP8), served by
+# the image built from hack/qwen38-flash-next/Dockerfile.
+#
+# Only spec.dynamoDeploymentSpec and spec.model are shown. Keep the rest of the existing
+# ModelDeployment (endpoints, schema, backendRef, rateLimit) as is.
+#
+# The controller adds these itself; do not repeat them in `arguments`:
+#   --model /models/<modelSubPath>  --served-model-name <name>  --block-size <kvCacheBlockSize>
+#   --kv-events-config {...}  --tensor-parallel-size <resources.gpu>
+# It also runs the container as root with IPC_LOCK/SYS_RESOURCE, mounts a 16Gi /dev/shm,
+# and adds the frontend sidecar.
+spec:
+  dynamoDeploymentSpec:
+    backendFramework: vllm
+    frontendImage: registry.dev.rafay-edge.net/tf/dynamo-frontend:1.4.2-fixes
+    decode:
+      runtimeContainerImage: registry.dev.rafay-edge.net/tf/dynamo-vllm-qwen38fn:1.4.2-vllm031.2
+      replicas: 1
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H200
+      resources:
+        # 8 TP worker processes + engine core + N-gram offload worker need real CPU.
+        # Memory: weights are read through the page cache and the 51 GB N-gram table lives in
+        # host RAM; 256Gi is comfortable, 100Gi thrashes.
+        requests: { cpu: "32", gpu: "8", memory: 256Gi }
+        limits:   { cpu: "32", gpu: "8", memory: 256Gi }
+      envs:
+        - { name: VLLM_SSM_CONV_STATE_LAYOUT, value: "DS" }   # GDN state layout; must match across workers if disaggregated
+        - { name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn }
+        - { name: NCCL_CUMEM_ENABLE, value: "1" }
+        - { name: NCCL_NVLS_ENABLE, value: "1" }
+        - { name: HF_HUB_OFFLINE, value: "1" }
+        - { name: TRANSFORMERS_OFFLINE, value: "1" }
+      arguments:
+        - --enable-expert-parallel          # TP8 + EP: plain TP8 is incompatible with the FP8 checkpoint's 128-wide blocks
+        - --moe-backend
+        - triton                            # upstream H200 recipe; auto would pick FlashInfer CUTLASS under EP
+        - --engram-config
+        - '{"cpu_offload":true}'            # 51B N-gram embedding table in host RAM (vLLM >= 0.31 form)
+        - --max-model-len
+        - "262144"
+        - --max-num-seqs
+        - "256"
+        - --gpu-memory-utilization
+        - "0.90"
+        - --kv-cache-dtype
+        - fp8                               # requires vLLM >= 0.31 (QSA fp8 main KV cache)
+        - --attention-config.indexer_kv_dtype
+        - fp8                               # requires vLLM >= 0.30 (QSA fp8 indexer cache)
+        - --enable-prefix-caching
+        - --no-disable-hybrid-kv-cache-manager
+        - --speculative-config
+        - '{"method":"mtp","num_speculative_tokens":3}'
+        - --enable-multimodal               # drop for text-only workloads to free encoder memory
+        - --dyn-tool-call-parser
+        - qwen3_coder
+        - --dyn-reasoning-parser
+        - qwen3
+  model:
+    cardType: pvc
+    pvcName: qwen38-flash-fp8-pvc           # ReadOnlyMany hostPath PV with Qwen/Qwen3.8-Flash-Next-FP8 on every GPU node
+    modelSubPath: ./
+    modelId: qwen-38-flash-next
+    modelFamilyname: qwen-38-flash-next
+    inputModalities: [text, image]
+    outputModalities: [text]
+    useCase: [chat, image]
