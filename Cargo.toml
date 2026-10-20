@@ -203,3 +203,12 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# frontend-crates#408 ("re-jail a complete start marker in trailing content") ported onto the
+# dynamo-parsers 7.0.1 release that dynamo 1.4.2 pins: RafaySystems/frontend-crates, branch
+# test/pr408-port-7.0.1. dynamo-protocols is patched to the same commit so the parser and
+# lib/llm share one copy of its types (both are 5.0.1). Remove once dynamo moves to a
+# dynamo-parsers release that includes #408.
+[patch.crates-io]
+dynamo-parsers = { git = "https://github.com/RafaySystems/frontend-crates.git", rev = "2062845874ba13b3ddd974c94f933c17acf1caea" }
+dynamo-protocols = { git = "https://github.com/RafaySystems/frontend-crates.git", rev = "2062845874ba13b3ddd974c94f933c17acf1caea" }
