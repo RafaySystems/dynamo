@@ -4,6 +4,9 @@
 # Only spec.dynamoDeploymentSpec and spec.model are shown. Keep the rest of the existing
 # ModelDeployment (endpoints, schema, backendRef, rateLimit) as is.
 #
+# Disaggregated serving: see README "Disaggregated prefill/decode" (vLLM 0.32.0 image, three extra
+# envs in spec.dynamoDeploymentSpec.envs, rdma/ib per worker).
+#
 # The controller adds these itself; do not repeat them in `arguments`:
 #   --model /models/<modelSubPath>  --served-model-name <name>  --block-size <kvCacheBlockSize>
 #   --kv-events-config {...}  --tensor-parallel-size <resources.gpu>
@@ -14,7 +17,7 @@ spec:
     backendFramework: vllm
     frontendImage: registry.dev.rafay-edge.net/tf/dynamo-frontend:1.4.2-fixes
     decode:
-      runtimeContainerImage: registry.dev.rafay-edge.net/tf/dynamo-vllm-qwen38fn:1.4.2-vllm031.2
+      runtimeContainerImage: registry.dev.rafay-edge.net/tf/dynamo-vllm-qwen38fn:1.4.2-vllm032.1
       replicas: 1
       nodeSelector:
         nvidia.com/gpu.product: NVIDIA-H200
